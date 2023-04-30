@@ -361,6 +361,7 @@ const (
 	BorReceipts = "BorReceipt"
 	BorTxLookup = "BlockBorTransactionLookup" // transaction_hash -> block_num_u64
 	BorSeparate = "BorSeparate"
+	BorFinality = "BorFinality"
 
 	// Downloader
 	BittorrentCompletion = "BittorrentCompletion"
@@ -529,6 +530,7 @@ var ChaindataTables = []string{
 	BorReceipts,
 	BorTxLookup,
 	BorSeparate,
+	BorFinality,
 	AccountKeys,
 	AccountVals,
 	AccountHistoryKeys,
