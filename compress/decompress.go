@@ -143,13 +143,12 @@ func SetDecompressionTableCondensity(fromBitSize int) {
 	condensePatternTableBitThreshold = fromBitSize
 }
 
-func NewDecompressor(compressedFilePath string) (*Decompressor, error) {
+func NewDecompressor(compressedFilePath string) (d *Decompressor, err error) {
 	_, fName := filepath.Split(compressedFilePath)
-	d := &Decompressor{
+	d = &Decompressor{
 		filePath: compressedFilePath,
 		fileName: fName,
 	}
-	var err error
 	defer func() {
 		if rec := recover(); rec != nil {
 			err = fmt.Errorf("decompressing file: %s, %+v, trace: %s", compressedFilePath, rec, dbg.Stack())
@@ -187,7 +186,7 @@ func NewDecompressor(compressedFilePath string) (*Decompressor, error) {
 
 	for i < dictSize {
 		d, ns := binary.Uvarint(data[i:])
-		if d > 2048 {
+		if d > 64 { // mainnet has maxDepth 31
 			return nil, fmt.Errorf("dictionary is invalid: patternMaxDepth=%d", d)
 		}
 		depths = append(depths, d)

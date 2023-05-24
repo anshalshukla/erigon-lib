@@ -25,6 +25,7 @@ import (
 	"testing"
 
 	"github.com/holiman/uint256"
+	"github.com/ledgerwatch/erigon-lib/txpool/txpoolcfg"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -37,6 +38,7 @@ import (
 	"github.com/ledgerwatch/erigon-lib/kv/kvcache"
 	"github.com/ledgerwatch/erigon-lib/kv/memdb"
 	"github.com/ledgerwatch/erigon-lib/types"
+	"github.com/ledgerwatch/log/v3"
 )
 
 func TestNonceFromAddress(t *testing.T) {
@@ -44,9 +46,9 @@ func TestNonceFromAddress(t *testing.T) {
 	ch := make(chan types.Announcements, 100)
 	db, coreDB := memdb.NewTestPoolDB(t), memdb.NewTestDB(t)
 
-	cfg := DefaultConfig
+	cfg := txpoolcfg.DefaultConfig
 	sendersCache := kvcache.New(kvcache.DefaultCoherentConfig)
-	pool, err := New(ch, coreDB, cfg, sendersCache, *u256.N1, nil)
+	pool, err := New(ch, coreDB, cfg, sendersCache, *u256.N1, nil, log.New())
 	assert.NoError(err)
 	require.True(pool != nil)
 	ctx := context.Background()
@@ -55,7 +57,7 @@ func TestNonceFromAddress(t *testing.T) {
 	// start blocks from 0, set empty hash - then kvcache will also work on this
 	h1 := gointerfaces.ConvertHashToH256([32]byte{})
 	change := &remote.StateChangeBatch{
-		StateVersionID:      stateVersionID,
+		StateVersionId:      stateVersionID,
 		PendingBlockBaseFee: pendingBaseFee,
 		BlockGasLimit:       1000000,
 		ChangeBatch: []*remote.StateChange{
@@ -164,9 +166,9 @@ func TestReplaceWithHigherFee(t *testing.T) {
 	ch := make(chan types.Announcements, 100)
 	db, coreDB := memdb.NewTestPoolDB(t), memdb.NewTestDB(t)
 
-	cfg := DefaultConfig
+	cfg := txpoolcfg.DefaultConfig
 	sendersCache := kvcache.New(kvcache.DefaultCoherentConfig)
-	pool, err := New(ch, coreDB, cfg, sendersCache, *u256.N1, nil)
+	pool, err := New(ch, coreDB, cfg, sendersCache, *u256.N1, nil, log.New())
 	assert.NoError(err)
 	require.True(pool != nil)
 	ctx := context.Background()
@@ -175,7 +177,7 @@ func TestReplaceWithHigherFee(t *testing.T) {
 	// start blocks from 0, set empty hash - then kvcache will also work on this
 	h1 := gointerfaces.ConvertHashToH256([32]byte{})
 	change := &remote.StateChangeBatch{
-		StateVersionID:      stateVersionID,
+		StateVersionId:      stateVersionID,
 		PendingBlockBaseFee: pendingBaseFee,
 		BlockGasLimit:       1000000,
 		ChangeBatch: []*remote.StateChange{
@@ -281,9 +283,9 @@ func TestReverseNonces(t *testing.T) {
 	ch := make(chan types.Announcements, 100)
 	db, coreDB := memdb.NewTestPoolDB(t), memdb.NewTestDB(t)
 
-	cfg := DefaultConfig
+	cfg := txpoolcfg.DefaultConfig
 	sendersCache := kvcache.New(kvcache.DefaultCoherentConfig)
-	pool, err := New(ch, coreDB, cfg, sendersCache, *u256.N1, nil)
+	pool, err := New(ch, coreDB, cfg, sendersCache, *u256.N1, nil, log.New())
 	assert.NoError(err)
 	require.True(pool != nil)
 	ctx := context.Background()
@@ -292,7 +294,7 @@ func TestReverseNonces(t *testing.T) {
 	// start blocks from 0, set empty hash - then kvcache will also work on this
 	h1 := gointerfaces.ConvertHashToH256([32]byte{})
 	change := &remote.StateChangeBatch{
-		StateVersionID:      stateVersionID,
+		StateVersionId:      stateVersionID,
 		PendingBlockBaseFee: pendingBaseFee,
 		BlockGasLimit:       1000000,
 		ChangeBatch: []*remote.StateChange{
@@ -408,9 +410,9 @@ func TestTxPoke(t *testing.T) {
 	ch := make(chan types.Announcements, 100)
 	db, coreDB := memdb.NewTestPoolDB(t), memdb.NewTestDB(t)
 
-	cfg := DefaultConfig
+	cfg := txpoolcfg.DefaultConfig
 	sendersCache := kvcache.New(kvcache.DefaultCoherentConfig)
-	pool, err := New(ch, coreDB, cfg, sendersCache, *u256.N1, nil)
+	pool, err := New(ch, coreDB, cfg, sendersCache, *u256.N1, nil, log.New())
 	assert.NoError(err)
 	require.True(pool != nil)
 	ctx := context.Background()
@@ -419,7 +421,7 @@ func TestTxPoke(t *testing.T) {
 	// start blocks from 0, set empty hash - then kvcache will also work on this
 	h1 := gointerfaces.ConvertHashToH256([32]byte{})
 	change := &remote.StateChangeBatch{
-		StateVersionID:      stateVersionID,
+		StateVersionId:      stateVersionID,
 		PendingBlockBaseFee: pendingBaseFee,
 		BlockGasLimit:       1000000,
 		ChangeBatch: []*remote.StateChange{
@@ -661,11 +663,13 @@ func TestShanghaiValidateTx(t *testing.T) {
 		},
 	}
 
+	logger := log.New()
+
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
 			ch := make(chan types.Announcements, 100)
 			_, coreDB := memdb.NewTestPoolDB(t), memdb.NewTestDB(t)
-			cfg := DefaultConfig
+			cfg := txpoolcfg.DefaultConfig
 
 			var shanghaiTime *big.Int
 			if test.isShanghai {
@@ -673,7 +677,7 @@ func TestShanghaiValidateTx(t *testing.T) {
 			}
 
 			cache := &kvcache.DummyCache{}
-			pool, err := New(ch, coreDB, cfg, cache, *u256.N1, shanghaiTime)
+			pool, err := New(ch, coreDB, cfg, cache, *u256.N1, shanghaiTime, logger)
 			asrt.NoError(err)
 			ctx := context.Background()
 			tx, err := coreDB.BeginRw(ctx)
@@ -698,7 +702,7 @@ func TestShanghaiValidateTx(t *testing.T) {
 				Txs:     append([]*types.TxSlot{}, txn),
 				Senders: types.Addresses{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
 			}
-			err = pool.senders.registerNewSenders(&txns)
+			err = pool.senders.registerNewSenders(&txns, logger)
 			asrt.NoError(err)
 			view, err := cache.View(ctx, tx)
 			asrt.NoError(err)

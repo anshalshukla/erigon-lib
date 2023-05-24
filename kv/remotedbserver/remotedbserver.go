@@ -27,8 +27,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/ledgerwatch/erigon-lib/kv/iter"
-	"github.com/ledgerwatch/erigon-lib/kv/order"
 	"github.com/ledgerwatch/log/v3"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -39,6 +37,8 @@ import (
 	"github.com/ledgerwatch/erigon-lib/gointerfaces/remote"
 	"github.com/ledgerwatch/erigon-lib/gointerfaces/types"
 	"github.com/ledgerwatch/erigon-lib/kv"
+	"github.com/ledgerwatch/erigon-lib/kv/iter"
+	"github.com/ledgerwatch/erigon-lib/kv/order"
 )
 
 // MaxTxTTL - kv interface provide high-consistancy guaranties: Serializable Isolations Level https://en.wikipedia.org/wiki/Isolation_(database_systems)
@@ -82,6 +82,7 @@ type KvServer struct {
 
 	trace     bool
 	rangeStep int // make sure `s.with` has limited time
+	logger    log.Logger
 }
 
 type threadSafeTx struct {
@@ -93,13 +94,14 @@ type Snapsthots interface {
 	Files() []string
 }
 
-func NewKvServer(ctx context.Context, db kv.RoDB, snapshots Snapsthots, historySnapshots Snapsthots) *KvServer {
+func NewKvServer(ctx context.Context, db kv.RoDB, snapshots Snapsthots, historySnapshots Snapsthots, logger log.Logger) *KvServer {
 	return &KvServer{
 		trace:     false,
 		rangeStep: 1024,
 		kv:        db, stateChangeStreams: newStateChangeStreams(), ctx: ctx,
 		blockSnapshots: snapshots, historySnapshots: historySnapshots,
 		txs: map[uint64]*threadSafeTx{}, txsMapLock: &sync.RWMutex{},
+		logger: logger,
 	}
 }
 
@@ -123,7 +125,7 @@ func (s *KvServer) Version(context.Context, *emptypb.Empty) (*types.VersionReply
 
 func (s *KvServer) begin(ctx context.Context) (id uint64, err error) {
 	if s.trace {
-		log.Info(fmt.Sprintf("[kv_server] begin %d %s\n", id, dbg.Stack()))
+		s.logger.Info(fmt.Sprintf("[kv_server] begin %d %s\n", id, dbg.Stack()))
 	}
 	s.txsMapLock.Lock()
 	defer s.txsMapLock.Unlock()
@@ -139,7 +141,7 @@ func (s *KvServer) begin(ctx context.Context) (id uint64, err error) {
 // renew - rollback and begin tx without changing it's `id`
 func (s *KvServer) renew(ctx context.Context, id uint64) (err error) {
 	if s.trace {
-		log.Info(fmt.Sprintf("[kv_server] renew %d %s\n", id, dbg.Stack()[:2]))
+		s.logger.Info(fmt.Sprintf("[kv_server] renew %d %s\n", id, dbg.Stack()[:2]))
 	}
 	s.txsMapLock.Lock()
 	defer s.txsMapLock.Unlock()
@@ -151,7 +153,7 @@ func (s *KvServer) renew(ctx context.Context, id uint64) (err error) {
 	}
 	newTx, errBegin := s.kv.BeginRo(ctx)
 	if errBegin != nil {
-		return err
+		return fmt.Errorf("kvserver: %w", err)
 	}
 	s.txs[id] = &threadSafeTx{Tx: newTx}
 	return nil
@@ -159,7 +161,7 @@ func (s *KvServer) renew(ctx context.Context, id uint64) (err error) {
 
 func (s *KvServer) rollback(id uint64) {
 	if s.trace {
-		log.Info(fmt.Sprintf("[kv_server] rollback %d %s\n", id, dbg.Stack()[:2]))
+		s.logger.Info(fmt.Sprintf("[kv_server] rollback %d %s\n", id, dbg.Stack()[:2]))
 	}
 	s.txsMapLock.Lock()
 	defer s.txsMapLock.Unlock()
@@ -189,16 +191,16 @@ func (s *KvServer) with(id uint64, f func(kv.Tx) error) error {
 	}
 
 	if s.trace {
-		log.Info(fmt.Sprintf("[kv_server] with %d try lock %s\n", id, dbg.Stack()[:2]))
+		s.logger.Info(fmt.Sprintf("[kv_server] with %d try lock %s\n", id, dbg.Stack()[:2]))
 	}
 	tx.Lock()
 	if s.trace {
-		log.Info(fmt.Sprintf("[kv_server] with %d can lock %s\n", id, dbg.Stack()[:2]))
+		s.logger.Info(fmt.Sprintf("[kv_server] with %d can lock %s\n", id, dbg.Stack()[:2]))
 	}
 	defer func() {
 		tx.Unlock()
 		if s.trace {
-			log.Info(fmt.Sprintf("[kv_server] with %d unlock %s\n", id, dbg.Stack()[:2]))
+			s.logger.Info(fmt.Sprintf("[kv_server] with %d unlock %s\n", id, dbg.Stack()[:2]))
 		}
 	}()
 	return f(tx.Tx)
@@ -216,9 +218,9 @@ func (s *KvServer) Tx(stream remote.KV_TxServer) error {
 		viewID = tx.ViewID()
 		return nil
 	}); err != nil {
-		return err
+		return fmt.Errorf("kvserver: %w", err)
 	}
-	if err := stream.Send(&remote.Pair{ViewID: viewID, TxID: id}); err != nil {
+	if err := stream.Send(&remote.Pair{ViewId: viewID, TxId: id}); err != nil {
 		return fmt.Errorf("server-side error: %w", err)
 	}
 
@@ -250,7 +252,7 @@ func (s *KvServer) Tx(stream remote.KV_TxServer) error {
 			for _, c := range cursors { // save positions of cursor, will restore after Tx reopening
 				k, v, err := c.c.Current()
 				if err != nil {
-					return err
+					return fmt.Errorf("kvserver: %w", err)
 				}
 				c.k = bytesCopy(k)
 				c.v = bytesCopy(v)
@@ -309,14 +311,14 @@ func (s *KvServer) Tx(stream remote.KV_TxServer) error {
 				}
 				return nil
 			}); err != nil {
-				return err
+				return fmt.Errorf("kvserver: %w", err)
 			}
 			cursors[CursorID] = &CursorInfo{
 				bucket: in.BucketName,
 				c:      c,
 			}
-			if err := stream.Send(&remote.Pair{CursorID: CursorID}); err != nil {
-				return fmt.Errorf("server-side error: %w", err)
+			if err := stream.Send(&remote.Pair{CursorId: CursorID}); err != nil {
+				return fmt.Errorf("kvserver: %w", err)
 			}
 			continue
 		case remote.Op_OPEN_DUP_SORT:
@@ -329,13 +331,13 @@ func (s *KvServer) Tx(stream remote.KV_TxServer) error {
 				}
 				return nil
 			}); err != nil {
-				return err
+				return fmt.Errorf("kvserver: %w", err)
 			}
 			cursors[CursorID] = &CursorInfo{
 				bucket: in.BucketName,
 				c:      c,
 			}
-			if err := stream.Send(&remote.Pair{CursorID: CursorID}); err != nil {
+			if err := stream.Send(&remote.Pair{CursorId: CursorID}); err != nil {
 				return fmt.Errorf("server-side error: %w", err)
 			}
 			continue
@@ -513,9 +515,16 @@ func (s *KvServer) DomainGet(ctx context.Context, req *remote.DomainGetReq) (rep
 		if !ok {
 			return fmt.Errorf("server DB doesn't implement kv.Temporal interface")
 		}
-		reply.V, reply.Ok, err = ttx.DomainGet(kv.Domain(req.Table), req.K, req.K2, req.Ts)
-		if err != nil {
-			return err
+		if req.Latest {
+			reply.V, reply.Ok, err = ttx.DomainGet(kv.Domain(req.Table), req.K, req.K2)
+			if err != nil {
+				return err
+			}
+		} else {
+			reply.V, reply.Ok, err = ttx.DomainGetAsOf(kv.Domain(req.Table), req.K, req.K2, req.Ts)
+			if err != nil {
+				return err
+			}
 		}
 		return nil
 	}); err != nil {
@@ -540,38 +549,6 @@ func (s *KvServer) HistoryGet(ctx context.Context, req *remote.HistoryGetReq) (r
 	}
 	return reply, nil
 }
-
-/*
-func (s *KvServer) IndexStream(req *remote.IndexRangeReq, stream remote.KV_IndexStreamServer) error {
-	const step = 4096 // make sure `s.with` has limited time
-	var last int
-	for from := int(req.FromTs); from < int(req.ToTs); from = last {
-		if err := s.with(req.TxId, func(tx kv.Tx) error {
-			ttx, ok := tx.(kv.TemporalTx)
-			if !ok {
-				return fmt.Errorf("server DB doesn't implement kv.Temporal interface")
-			}
-			it, err := ttx.IndexRange(kv.InvertedIdx(req.Table), req.K, uint64(from), uint64(req.ToTs), order.By(req.OrderAscend), step)
-			if err != nil {
-				return err
-			}
-			bm, err := it.(bitmapdb.ToBitamp).ToBitmap()
-			if err != nil {
-				return err
-			}
-			if err := stream.Send(&remote.IndexRangeReply{Timestamps: bm.ToArray()}); err != nil {
-				return err
-			}
-			last = int(bm.Maximum())
-			return nil
-		}); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-*/
 
 const PageSizeLimit = 4 * 4096
 
@@ -622,92 +599,6 @@ func (s *KvServer) IndexRange(ctx context.Context, req *remote.IndexRangeReq) (*
 	}
 	return reply, nil
 }
-
-/*
-func (s *KvServer) Stream(req *remote.RangeReq, stream remote.KV_StreamServer) error {
-	orderAscend, fromPrefix, toPrefix := req.OrderAscend, req.FromPrefix, req.ToPrefix
-	if orderAscend && fromPrefix != nil && toPrefix != nil && bytes.Compare(fromPrefix, toPrefix) >= 0 {
-		return fmt.Errorf("tx.Dual: %x must be lexicographicaly before %x", fromPrefix, toPrefix)
-	}
-	if !orderAscend && fromPrefix != nil && toPrefix != nil && bytes.Compare(fromPrefix, toPrefix) <= 0 {
-		return fmt.Errorf("tx.Dual: %x must be lexicographicaly before %x", toPrefix, fromPrefix)
-	}
-
-	var k, v []byte
-
-	if req.OrderAscend && fromPrefix == nil {
-		fromPrefix = []byte{}
-	}
-
-	var it iter.KV
-	var err error
-	var skipFirst = false
-
-	limit := int(req.PageSize)
-	step := cmp.Min(s.rangeStep, limit) // make sure `s.with` has limited time
-	for from := fromPrefix; ; from = k {
-		if (req.OrderAscend && from == nil) || limit == 0 {
-			break
-		}
-		if toPrefix != nil {
-			cmp := bytes.Compare(from, toPrefix)
-			hasNext := (orderAscend && cmp < 0) || (!orderAscend && cmp > 0)
-			if !hasNext {
-				break
-			}
-		}
-
-		reply := &remote.Pairs{}
-		if err = s.with(req.TxId, func(tx kv.Tx) error {
-			if orderAscend {
-				it, err = tx.RangeAscend(req.Table, from, toPrefix, step)
-				if err != nil {
-					return err
-				}
-			} else {
-				it, err = tx.RangeDescend(req.Table, from, toPrefix, step)
-				if err != nil {
-					return err
-				}
-			}
-			k = nil
-			for it.HasNext() {
-				k, v, err = it.Next()
-				if err != nil {
-					return err
-				}
-				reply.Keys = append(reply.Keys, k)
-				reply.Values = append(reply.Values, v)
-				limit--
-			}
-			if k != nil {
-				k = common.Copy(k)
-				if req.OrderAscend {
-					k = append(k, []byte{01}...)
-				} else {
-					if skipFirst {
-						reply.Keys = reply.Keys[1:]
-						reply.Values = reply.Values[1:]
-					}
-					skipFirst = true
-				}
-			}
-			return nil
-		}); err != nil {
-			return err
-		}
-
-		if len(reply.Keys) > 0 {
-			if err := stream.Send(reply); err != nil {
-				return err
-			}
-		} else {
-			break
-		}
-	}
-	return nil
-}
-*/
 
 func (s *KvServer) Range(ctx context.Context, req *remote.RangeReq) (*remote.Pairs, error) {
 	from, limit := req.FromPrefix, int(req.Limit)

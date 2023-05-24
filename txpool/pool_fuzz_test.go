@@ -6,8 +6,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"github.com/ledgerwatch/erigon-lib/common"
 	"testing"
+
+	"github.com/ledgerwatch/erigon-lib/common"
+	"github.com/ledgerwatch/erigon-lib/txpool/txpoolcfg"
 
 	"github.com/holiman/uint256"
 	"github.com/ledgerwatch/log/v3"
@@ -310,9 +312,9 @@ func FuzzOnNewBlocks(f *testing.F) {
 		ch := make(chan types.Announcements, 100)
 		db, coreDB := memdb.NewTestPoolDB(t), memdb.NewTestDB(t)
 
-		cfg := DefaultConfig
+		cfg := txpoolcfg.DefaultConfig
 		sendersCache := kvcache.New(kvcache.DefaultCoherentConfig)
-		pool, err := New(ch, coreDB, cfg, sendersCache, *u256.N1, nil)
+		pool, err := New(ch, coreDB, cfg, sendersCache, *u256.N1, nil, log.New())
 		assert.NoError(err)
 		pool.senders.senderIDs = senderIDs
 		for addr, id := range senderIDs {
@@ -470,7 +472,7 @@ func FuzzOnNewBlocks(f *testing.F) {
 			return nil
 		})
 		change := &remote.StateChangeBatch{
-			StateVersionID:      txID,
+			StateVersionId:      txID,
 			PendingBlockBaseFee: pendingBaseFee,
 			ChangeBatch: []*remote.StateChange{
 				{BlockHeight: 0, BlockHash: h0},
@@ -495,7 +497,7 @@ func FuzzOnNewBlocks(f *testing.F) {
 
 		_, _, _ = p2pReceived, txs2, txs3
 		change = &remote.StateChangeBatch{
-			StateVersionID:      txID,
+			StateVersionId:      txID,
 			PendingBlockBaseFee: pendingBaseFee,
 			ChangeBatch: []*remote.StateChange{
 				{BlockHeight: 1, BlockHash: h0},
@@ -508,7 +510,7 @@ func FuzzOnNewBlocks(f *testing.F) {
 
 		// unwind everything and switch to new fork (need unwind mined now)
 		change = &remote.StateChangeBatch{
-			StateVersionID:      txID,
+			StateVersionId:      txID,
 			PendingBlockBaseFee: pendingBaseFee,
 			ChangeBatch: []*remote.StateChange{
 				{BlockHeight: 0, BlockHash: h0, Direction: remote.Direction_UNWIND},
@@ -520,7 +522,7 @@ func FuzzOnNewBlocks(f *testing.F) {
 		checkNotify(txs2, types.TxSlots{}, "fork2")
 
 		change = &remote.StateChangeBatch{
-			StateVersionID:      txID,
+			StateVersionId:      txID,
 			PendingBlockBaseFee: pendingBaseFee,
 			ChangeBatch: []*remote.StateChange{
 				{BlockHeight: 1, BlockHash: h22},
@@ -543,7 +545,7 @@ func FuzzOnNewBlocks(f *testing.F) {
 		check(p2pReceived, types.TxSlots{}, "after_flush")
 		checkNotify(p2pReceived, types.TxSlots{}, "after_flush")
 
-		p2, err := New(ch, coreDB, DefaultConfig, sendersCache, *u256.N1, nil)
+		p2, err := New(ch, coreDB, txpoolcfg.DefaultConfig, sendersCache, *u256.N1, nil, log.New())
 		assert.NoError(err)
 		p2.senders = pool.senders // senders are not persisted
 		err = coreDB.View(ctx, func(coreTx kv.Tx) error { return p2.fromDB(ctx, tx, coreTx) })

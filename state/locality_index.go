@@ -50,18 +50,21 @@ type LocalityIndex struct {
 
 	roFiles  atomic.Pointer[ctxItem]
 	roBmFile atomic.Pointer[bitmapdb.FixedSizeBitmaps]
+	logger   log.Logger
 }
 
 func NewLocalityIndex(
 	dir, tmpdir string,
 	aggregationStep uint64,
 	filenameBase string,
+	logger log.Logger,
 ) (*LocalityIndex, error) {
 	li := &LocalityIndex{
 		dir:             dir,
 		tmpdir:          tmpdir,
 		aggregationStep: aggregationStep,
 		filenameBase:    filenameBase,
+		logger:          logger,
 	}
 	return li, nil
 }
@@ -101,39 +104,41 @@ func (li *LocalityIndex) scanStateFiles(fNames []string) (uselessFiles []*filesI
 		subs := re.FindStringSubmatch(name)
 		if len(subs) != 3 {
 			if len(subs) != 0 {
-				log.Warn("File ignored by inverted index scan, more than 3 submatches", "name", name, "submatches", len(subs))
+				li.logger.Warn("File ignored by inverted index scan, more than 3 submatches", "name", name, "submatches", len(subs))
 			}
 			continue
 		}
 		var startStep, endStep uint64
 		if startStep, err = strconv.ParseUint(subs[1], 10, 64); err != nil {
-			log.Warn("File ignored by inverted index scan, parsing startTxNum", "error", err, "name", name)
+			li.logger.Warn("File ignored by inverted index scan, parsing startTxNum", "error", err, "name", name)
 			continue
 		}
 		if endStep, err = strconv.ParseUint(subs[2], 10, 64); err != nil {
-			log.Warn("File ignored by inverted index scan, parsing endTxNum", "error", err, "name", name)
+			li.logger.Warn("File ignored by inverted index scan, parsing endTxNum", "error", err, "name", name)
 			continue
 		}
 		if startStep > endStep {
-			log.Warn("File ignored by inverted index scan, startTxNum > endTxNum", "name", name)
+			li.logger.Warn("File ignored by inverted index scan, startTxNum > endTxNum", "name", name)
 			continue
 		}
 
 		if startStep != 0 {
-			log.Warn("LocalityIndex must always starts from step 0")
+			li.logger.Warn("LocalityIndex must always starts from step 0")
 			continue
 		}
 		if endStep > StepsInBiggestFile*LocalityIndexUint64Limit {
-			log.Warn("LocalityIndex does store bitmaps as uint64, means it can't handle > 2048 steps. But it's possible to implement")
+			li.logger.Warn("LocalityIndex does store bitmaps as uint64, means it can't handle > 2048 steps. But it's possible to implement")
 			continue
 		}
 
 		startTxNum, endTxNum := startStep*li.aggregationStep, endStep*li.aggregationStep
 		if li.file == nil {
-			li.file = &filesItem{startTxNum: startTxNum, endTxNum: endTxNum, frozen: false}
+			li.file = newFilesItem(startTxNum, endTxNum, li.aggregationStep)
+			li.file.frozen = false // LocalityIndex files are never frozen
 		} else if li.file.endTxNum < endTxNum {
 			uselessFiles = append(uselessFiles, li.file)
-			li.file = &filesItem{startTxNum: startTxNum, endTxNum: endTxNum, frozen: false}
+			li.file = newFilesItem(startTxNum, endTxNum, li.aggregationStep)
+			li.file.frozen = false // LocalityIndex files are never frozen
 		}
 	}
 	return uselessFiles
@@ -207,27 +212,27 @@ func (li *LocalityIndex) MakeContext() *ctxLocalityIdx {
 	return x
 }
 
-func (out *ctxLocalityIdx) Close() {
+func (out *ctxLocalityIdx) Close(logger log.Logger) {
 	if out == nil || out.file == nil || out.file.src == nil {
 		return
 	}
 	refCnt := out.file.src.refcount.Add(-1)
 	if refCnt == 0 && out.file.src.canDelete.Load() {
-		closeLocalityIndexFilesAndRemove(out)
+		closeLocalityIndexFilesAndRemove(out, logger)
 	}
 }
 
-func closeLocalityIndexFilesAndRemove(i *ctxLocalityIdx) {
+func closeLocalityIndexFilesAndRemove(i *ctxLocalityIdx, logger log.Logger) {
 	if i.file.src != nil {
 		i.file.src.closeFilesAndRemove()
 		i.file.src = nil
 	}
 	if i.bm != nil {
 		if err := i.bm.Close(); err != nil {
-			log.Trace("close", "err", err, "file", i.bm.FileName())
+			logger.Trace("close", "err", err, "file", i.bm.FileName())
 		}
 		if err := os.Remove(i.bm.FilePath()); err != nil {
-			log.Trace("os.Remove", "err", err, "file", i.bm.FileName())
+			logger.Trace("os.Remove", "err", err, "file", i.bm.FileName())
 		}
 		i.bm = nil
 	}
@@ -267,42 +272,35 @@ func (li *LocalityIndex) lookupIdxFiles(loc *ctxLocalityIdx, key []byte, fromTxN
 	return fn1 * StepsInBiggestFile, fn2 * StepsInBiggestFile, loc.file.endTxNum, ok1, ok2
 }
 
-func (li *LocalityIndex) missedIdxFiles(ii *InvertedIndex) (toStep uint64, idxExists bool) {
-	a, _ := ii.files.Max()
-	if a == nil {
-		a = &filesItem{}
+func (li *LocalityIndex) missedIdxFiles(ii *InvertedIndexContext) (toStep uint64, idxExists bool) {
+	if len(ii.files) == 0 {
+		return 0, true
 	}
-	ii.files.Descend(a, func(item *filesItem) bool {
-		if item.endTxNum-item.startTxNum == StepsInBiggestFile*li.aggregationStep {
-			toStep = item.endTxNum / li.aggregationStep
-			return false
+	var item *ctxItem
+	for i := len(ii.files) - 1; i >= 0; i-- {
+		if ii.files[i].src.frozen {
+			item = &ii.files[i]
+			break
 		}
-		return true
-	})
+	}
+	if item != nil {
+		toStep = item.endTxNum / li.aggregationStep
+	}
 	fName := fmt.Sprintf("%s.%d-%d.li", li.filenameBase, 0, toStep)
 	return toStep, dir.FileExist(filepath.Join(li.dir, fName))
 }
-func (li *LocalityIndex) buildFiles(ctx context.Context, ii *InvertedIndex, toStep uint64) (files *LocalityIndexFiles, err error) {
-	defer ii.EnableMadvNormalReadAhead().DisableReadAhead()
+func (li *LocalityIndex) buildFiles(ctx context.Context, ic *InvertedIndexContext, toStep uint64) (files *LocalityIndexFiles, err error) {
+	defer ic.ii.EnableMadvNormalReadAhead().DisableReadAhead()
 
 	logEvery := time.NewTicker(30 * time.Second)
 	defer logEvery.Stop()
 
 	fromStep := uint64(0)
-	ic := ii.MakeContext()
-	defer ic.Close()
 	count := 0
 	it := ic.iterateKeysLocality(toStep * li.aggregationStep)
 	for it.HasNext() {
 		_, _ = it.Next()
 		count++
-		//select {
-		//case <-ctx.Done():
-		//	return nil, ctx.Err()
-		//case <-logEvery.C:
-		//	log.Info("[LocalityIndex] build", "name", li.filenameBase, "progress", fmt.Sprintf("%.2f%%", it.Progress()/2))
-		//default:
-		//}
 	}
 
 	fName := fmt.Sprintf("%s.%d-%d.li", li.filenameBase, fromStep, toStep)
@@ -316,7 +314,7 @@ func (li *LocalityIndex) buildFiles(ctx context.Context, ii *InvertedIndex, toSt
 		LeafSize:   8,
 		TmpDir:     li.tmpdir,
 		IndexFile:  idxPath,
-	})
+	}, li.logger)
 	if err != nil {
 		return nil, fmt.Errorf("create recsplit: %w", err)
 	}
@@ -346,7 +344,7 @@ func (li *LocalityIndex) buildFiles(ctx context.Context, ii *InvertedIndex, toSt
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			case <-logEvery.C:
-				log.Info("[LocalityIndex] build", "name", li.filenameBase, "progress", fmt.Sprintf("%.2f%%", 50+it.Progress()/2))
+				li.logger.Info("[LocalityIndex] build", "name", li.filenameBase, "progress", fmt.Sprintf("%.2f%%", 50+it.Progress()/2))
 			default:
 			}
 		}
@@ -357,7 +355,7 @@ func (li *LocalityIndex) buildFiles(ctx context.Context, ii *InvertedIndex, toSt
 
 		if err = rs.Build(); err != nil {
 			if rs.Collision() {
-				log.Debug("Building recsplit. Collision happened. It's ok. Restarting...")
+				li.logger.Debug("Building recsplit. Collision happened. It's ok. Restarting...")
 				rs.ResetNextSalt()
 			} else {
 				return nil, fmt.Errorf("build idx: %w", err)
@@ -392,7 +390,7 @@ func (li *LocalityIndex) integrateFiles(sf LocalityIndexFiles, txNumFrom, txNumT
 	li.reCalcRoFiles()
 }
 
-func (li *LocalityIndex) BuildMissedIndices(ctx context.Context, ii *InvertedIndex) error {
+func (li *LocalityIndex) BuildMissedIndices(ctx context.Context, ii *InvertedIndexContext) error {
 	if li == nil {
 		return nil
 	}
@@ -505,26 +503,4 @@ func (ic *InvertedIndexContext) iterateKeysLocality(uptoTxNum uint64) *LocalityI
 	}
 	si.advance()
 	return si
-}
-
-func (li *LocalityIndex) CleanupDir() {
-	if li == nil || li.dir == "" {
-		return
-	}
-	/*
-		files, err := os.ReadDir(li.dir)
-		if err != nil {
-			log.Warn("[clean] can't read dir", "err", err, "dir", li.dir)
-			return
-		}
-		uselessFiles := li.scanStateFiles(files)
-		for _, f := range uselessFiles {
-			fName := fmt.Sprintf("%s.%d-%d.l", li.filenameBase, f.startTxNum/li.aggregationStep, f.endTxNum/li.aggregationStep)
-			err = os.Remove(filepath.Join(li.dir, fName))
-			log.Debug("[clean] remove", "file", fName, "err", err)
-			fIdxName := fmt.Sprintf("%s.%d-%d.li", li.filenameBase, f.startTxNum/li.aggregationStep, f.endTxNum/li.aggregationStep)
-			err = os.Remove(filepath.Join(li.dir, fIdxName))
-			log.Debug("[clean] remove", "file", fName, "err", err)
-		}
-	*/
 }
